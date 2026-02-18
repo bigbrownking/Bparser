@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -14,15 +15,26 @@ import org.springframework.util.MultiValueMap;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.netty.http.client.HttpClient;
-import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import reactor.util.retry.Retry;
 
-import java.net.URLEncoder;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.*;
+import java.util.Base64;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class Parser {
 
@@ -47,95 +59,80 @@ public class Parser {
     private String redirectUri;
 
     private String sessionCookie = "";
+    private String currentToken;
 
     private final WebClient webClient;
+    private static final String HEADER = "id|taxpayer_name_latin|taxpayer_name_cyrillic|taxpayer_name_original|sex|taxpayer_birthday|citizenship|taxpayer_iin_bin|taxpayer_personal_number|photography_refusing_reason|intersection_status|death_date|death_country|death_reg_place|death_add_information|document_number|document_type|document_issue_date|document_validity_period|document_issue_country|document_issuing_authority|duty_officer_decision|duty_officer_decision_date|duty_officer_decision_add_info|date|detention_place|police_nariad|decision_making_body|decison_making_authority|place_of_birth|location|place_of_work|family_information|education|supression_date|checkpoint|entry_exit_place|trip_purpose|border_crossing_method|direction|exit_country|departure_point|entry_country|destination_pint|system_number|create_date|creater|source|serial_number|status|flight_train_number|belonging|flight_class|flight_type|flight_transport_vessel_number|flight_date_fact|flight_date_plan|vin_code|trailer_number|mark_type|colour|owner|vessel_name|home_port|carriage_quantity|foreign_carriage_quantity|visa_frequency|visa_category|visa_type|visa_number|visa_start_date|visa_expiration_date|document_number1|iin|start_date|expiration_date|actual_date";
 
-    // -----------------------------
+    private static final Random random = new Random();
+    private final List<String> globalCsvLines = Collections.synchronizedList(new ArrayList<>());
+    private volatile boolean exportRunning = false;
+
     // PUBLIC API
-    // -----------------------------
-    public String exportCsv(String dateFrom, String dateTo) throws Exception {
-        String token = authenticateAndGetToken();
-        return requestData(dateFrom, dateTo, token);
+    public Mono<String> exportCsv(String dateFrom, String dateTo, int startPage) {
+        return authenticateAndGetToken()
+                .doOnNext(token -> currentToken = token)
+                .flatMap(token -> requestData(dateFrom, dateTo, startPage));
     }
 
-    // -----------------------------
-    // MAIN AUTH FLOW
-    // -----------------------------
-    private String authenticateAndGetToken() throws JsonProcessingException {
+    private Mono<String> authenticateAndGetToken() {
         log("=== STEP 0: GET /auth-service/login ===");
-        fetchLoginPage();
-
-        log("=== STEP 1: POST /auth-service/login → get code ===");
-        String code = submitLoginForm();
-
-        log("AUTH CODE = " + code);
-
-        log("=== STEP 2: POST /oauth/token → get access_token ===");
-        return exchangeCodeForToken(code);
+        return fetchLoginPage()
+                .then(Mono.defer(() -> {
+                    log("=== STEP 1: POST /auth-service/login → get code ===");
+                    return submitLoginForm();
+                }))
+                .flatMap(code -> {
+                    log("AUTH CODE = " + code);
+                    log("=== STEP 2: POST /oauth/token → get access_token ===");
+                    return exchangeCodeForToken(code);
+                });
     }
 
-    // -----------------------------
-    // GET /auth-service/login
-    // -----------------------------
-    private void fetchLoginPage() {
-        ClientResponse resp = webClient.get()
+    private Mono<Void> fetchLoginPage() {
+        return webClient.get()
                 .uri(BASE + "/auth-service/login")
                 .header(HttpHeaders.USER_AGENT, UA)
                 .header(HttpHeaders.ACCEPT, "text/html")
-                .exchangeToMono(Mono::just)
-                .block();
-
-        String body = readAndLogBody(resp);
-
-        extractCookies(resp);
-        log("SESSION COOKIE after GET /login: " + sessionCookie);
-
-        if (!resp.statusCode().is2xxSuccessful()) {
-            throw new RuntimeException("GET /login failed: " + resp.statusCode() + " BODY: " + body);
-        }
+                .exchangeToMono(resp -> {
+                    extractCookies(resp);
+                    log("SESSION COOKIE after GET /login: " + sessionCookie);
+                    if (!resp.statusCode().is2xxSuccessful()) {
+                        return Mono.error(new RuntimeException("GET /login failed: " + resp.statusCode()));
+                    }
+                    return Mono.empty();
+                });
     }
 
-    // -----------------------------
-    // POST /auth-service/login → get code
-    // -----------------------------
-    private String submitLoginForm() {
+    private Mono<String> submitLoginForm() {
         MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
         form.add("username", username);
         form.add("password", password);
         form.add("approve", "on");
 
-        ClientResponse resp = webClient.post()
+        return webClient.post()
                 .uri(BASE + "/auth-service/login")
                 .header(HttpHeaders.COOKIE, sessionCookie)
                 .header(HttpHeaders.USER_AGENT, UA)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .bodyValue(form)
-                .exchangeToMono(Mono::just)
-                .block();
+                .exchangeToMono(resp -> {
+                    extractCookies(resp);
+                    log("SESSION after POST /login: " + sessionCookie);
 
-        readAndLogBody(resp);
-
-        extractCookies(resp);
-        log("SESSION after POST /login: " + sessionCookie);
-
-        List<String> loc = resp.headers().header(HttpHeaders.LOCATION);
-        if (loc != null && !loc.isEmpty() && loc.get(0).contains("code=")) {
-            return extractCode(loc.get(0));
-        }
-
-        throw new RuntimeException("Authorization code not found after login!");
+                    List<String> loc = resp.headers().header(HttpHeaders.LOCATION);
+                    if (loc != null && !loc.isEmpty() && loc.get(0).contains("code=")) {
+                        return Mono.just(extractCode(loc.get(0)));
+                    }
+                    return Mono.error(new RuntimeException("Authorization code not found after login!"));
+                });
     }
 
-    // -----------------------------
-    // POST /oauth/token → get access_token
-    // -----------------------------
-    private String exchangeCodeForToken(String code) throws JsonProcessingException {
-
+    private Mono<String> exchangeCodeForToken(String code) {
         String basic = "Basic " + Base64.getEncoder()
-                .encodeToString((clientId + ":" + clientSecret)
-                        .getBytes(StandardCharsets.UTF_8));
+                .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
 
-        String body = webClient.post()
+        return webClient.post()
                 .uri(BASE + "/auth-service/oauth/token")
                 .header(HttpHeaders.COOKIE, sessionCookie)
                 .header(HttpHeaders.AUTHORIZATION, basic)
@@ -144,171 +141,149 @@ public class Parser {
                 .body(BodyInserters.fromFormData("grant_type", "authorization_code")
                         .with("scope", "openid")
                         .with("redirect_uri", redirectUri)
-                        .with("code", code)
-                )
+                        .with("code", code))
                 .retrieve()
                 .bodyToMono(String.class)
-                .block();
-
-        Map<String, Object> map =
-                mapper.readValue(body, new TypeReference<>() {
+                .map(body -> {
+                    try {
+                        Map<String, Object> map = mapper.readValue(body, new TypeReference<>() {});
+                        return (String) map.get("access_token");
+                    } catch (JsonProcessingException e) {
+                        throw new RuntimeException("Failed to parse access token", e);
+                    }
                 });
-
-        return map.get("access_token").toString();
     }
 
+    private Mono<String> requestData(String from, String to, int startPageUser) {
+        int startPage = Math.max(0, startPageUser - 1);
 
-    // -----------------------------
-    // Data Request
-    // -----------------------------
-    private String requestData(String from, String to, String token) throws JsonProcessingException {
         String requestBody = """
+        {
+          "fields":[
             {
-              "fields":[
-                {
-                  "name":"statusDatetime",
-                  "compareOperator":"BETWEEN",
-                  "compareValues":["%s","%s"]
-                }
-              ]
+              "name":"statusDatetime",
+              "compareOperator":"BETWEEN",
+              "compareValues":["%s","%s"]
             }
-            """.formatted(from, to);
+          ]
+        }
+        """.formatted(from, to);
 
         log("Requesting data...");
 
-        String currentToken = token;
-        int currentPage = 0;
-        int totalPages = 0;
-        List<String> csvLines = new ArrayList<>();
-        Random random = new Random();
-        boolean headerAdded = false;
+        Path baseDir = Paths.get("").toAbsolutePath();
+        Path exportDir = baseDir.resolve("export");
+        try {
+            Files.createDirectories(exportDir);
+        } catch (IOException e) {
+            throw new RuntimeException("Cannot create export folder", e);
+        }
 
-        while (true) {
-            try {
-                // Если это первая итерация или мы начинаем заново после ошибки
-                if (currentPage == 0 && !headerAdded) {
-                    // Получаем первую страницу для определения общего количества страниц
-                    String firstPageBody = webClient.post()
-                            .uri(BASE + "/pp-center-service/api/crossing-facts/search?page=0&size=200")
-                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + currentToken)
-                            .header(HttpHeaders.CONTENT_TYPE, "application/json")
-                            .header(HttpHeaders.COOKIE, sessionCookie)
-                            .bodyValue(requestBody)
-                            .retrieve()
-                            .bodyToMono(String.class)
-                            .block();
+        Path finalFile = exportDir.resolve("result.csv");
 
-                    if (firstPageBody == null || firstPageBody.isEmpty()) {
-                        return "";
+        exportRunning = true;
+        globalCsvLines.clear();
+        globalCsvLines.add(HEADER);
+
+        AtomicInteger processedPages = new AtomicInteger(0);
+        AtomicInteger totalPagesRef = new AtomicInteger(1);
+
+        Function<Integer, Mono<JsonNode>> fetchPage = page -> webClient.post()
+                .uri(BASE + "/pp-center-service/api/crossing-facts/search?page=" + page + "&size=200")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + currentToken)
+                .header(HttpHeaders.CONTENT_TYPE, "application/json")
+                .header(HttpHeaders.COOKIE, sessionCookie)
+                .bodyValue(requestBody)
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(body -> {
+                    try {
+                        log("Processing page: " + page);
+                        return mapper.readTree(body);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
                     }
+                })
+                .retryWhen(Retry.backoff(Long.MAX_VALUE, Duration.ofSeconds(5))
+                        .maxBackoff(Duration.ofMinutes(2))
+                        .filter(ex -> {
+                            if (ex instanceof WebClientResponseException wcre) {
+                                int status = wcre.getStatusCode().value();
+                                return status == 401 || status == 403 || status == 400 ||
+                                        status == 500 || status == 501 || status == 502;
+                            }
+                            return false;
+                        })
+                        .doBeforeRetryAsync(signal -> {
+                            Throwable ex = signal.failure();
+                            if (ex instanceof WebClientResponseException wcre) {
+                                int status = wcre.getStatusCode().value();
+                                if (status == 500 || status == 501 || status == 502) {
+                                    log("⚠ Server error 500 — retrying (attempt " + (signal.totalRetries() + 1) + ")");
+                                    return Mono.empty();
+                                } else if (status == 401 || status == 403 || status == 400) {
+                                    log("Token expired — re-authenticating (attempt " + (signal.totalRetries() + 1) + ")");
+                                    return authenticateAndGetToken()
+                                            .doOnNext(token -> currentToken = token)
+                                            .then();
+                                }
+                            }
+                            return Mono.empty();
+                        }));
 
-                    JsonNode firstPageRoot = mapper.readTree(firstPageBody);
-                    JsonNode pageInfo = firstPageRoot.path("page");
-                    totalPages = pageInfo.path("totalPages").asInt(0);
+        return fetchPage.apply(startPage)
+                .flatMap(first -> {
+                    JsonNode pageInfo = first.path("page");
+                    int totalPages = pageInfo.path("totalPages").asInt(1);
                     int totalElements = pageInfo.path("totalElements").asInt(0);
 
+                    totalPagesRef.set(totalPages);
                     log("Total records: " + totalElements + ", Total pages: " + totalPages);
 
-                    if (totalPages == 0) {
-                        return "";
-                    }
+                    if (totalPages == 0) return Mono.just("");
 
-                    // Добавляем заголовок один раз
-                    String header = "id|taxpayer_name_latin|taxpayer_name_cyrillic|taxpayer_name_original|sex|taxpayer_birthday|citizenship|taxpayer_iin_bin|taxpayer_personal_number|photography_refusing_reason|intersection_status|death_date|death_country|death_reg_place|death_add_information|document_number|document_type|document_issue_date|document_validity_period|document_issue_country|document_issuing_authority|duty_officer_decision|duty_officer_decision_date|duty_officer_decision_add_info|date|detention_place|police_nariad|decision_making_body|decison_making_authority|place_of_birth|location|place_of_work|family_information|education|supression_date|checkpoint|entry_exit_place|trip_purpose|border_crossing_method|direction|exit_country|departure_point|entry_country|destination_pint|system_number|create_date|creater|source|serial_number|status|flight_train_number|belonging|flight_class|flight_type|flight_transport_vessel_number|flight_date_fact|flight_date_plan|vin_code|trailer_number|mark_type|colour|owner|vessel_name|home_port|carriage_quantity|foreign_carriage_quantity|visa_frequency|visa_category|visa_type|visa_number|visa_start_date|visa_expiration_date|document_number1|iin|start_date|expiration_date|actual_date";
-                    csvLines.add(header);
-                    headerAdded = true;
+                    processPageData(first, globalCsvLines);
+                    processedPages.incrementAndGet();
 
-                    // Обрабатываем первую страницу
-                    processPageData(firstPageRoot, csvLines);
-                    currentPage = 1;
-                }
+                    return Flux.range(startPage + 1, totalPages - (startPage + 1))
+                            .delayElements(Duration.ofMillis(400 + random.nextInt(600)))
+                            .concatMap(page -> fetchPage.apply(page)
+                                    .doOnNext(json -> {
+                                        processPageData(json, globalCsvLines);
+                                        int done = processedPages.incrementAndGet();
+                                        if (done % 50 == 0) {
+                                            saveTempFile(exportDir, page);
+                                        }
+                                    }))
+                            .then(Mono.fromCallable(() -> {
+                                Files.write(finalFile, globalCsvLines, StandardCharsets.UTF_8,
+                                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                                log("✔ Final file saved: " + finalFile.toAbsolutePath());
+                                return String.join("\n", globalCsvLines);
+                            }));
+                })
+                .onErrorResume(e -> {
+                    log("FATAL ERROR: " + e.getMessage());
+                    return Mono.just(String.join("\n", globalCsvLines));
+                });
+    }
+    private void saveTempFile(Path exportDir, int page){
+        page++;
+        try {
+            Path file = exportDir.resolve("progress_page_" + page + ".csv");
+            Files.write(file, globalCsvLines, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
-                // Обрабатываем остальные страницы
-                for (int page = currentPage; page < totalPages; page++) {
-                    log("Processing page " + (page + 1) + " of " + totalPages);
+            log("💾 Auto-saved CSV at page " + page + ": " + file.toAbsolutePath());
 
-                    if (page > 0) {
-                        long delay = 400 + random.nextLong(500);
-                        try {
-                            Thread.sleep(delay);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
-                    }
-
-                    String pageBody = webClient.post()
-                            .uri(BASE + "/pp-center-service/api/crossing-facts/search?page=" + page + "&size=200")
-                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + currentToken)
-                            .header(HttpHeaders.CONTENT_TYPE, "application/json")
-                            .header(HttpHeaders.COOKIE, sessionCookie)
-                            .bodyValue(requestBody)
-                            .retrieve()
-                            .bodyToMono(String.class)
-                            .block();
-
-                    if (pageBody == null || pageBody.isEmpty()) {
-                        log("Warning: Page " + page + " returned empty response");
-                        continue;
-                    }
-
-                    JsonNode root = mapper.readTree(pageBody);
-                    processPageData(root, csvLines);
-
-                    currentPage = page + 1; // Сохраняем прогресс
-                }
-
-                log("Total records processed: " + (csvLines.size() - 1)); // -1 для исключения заголовка
-                return String.join("\n", csvLines);
-
-            } catch (Exception e) {
-                String errorMsg = e.getMessage();
-                log("Error occurred at page " + currentPage + ": " + errorMsg);
-
-                // Проверяем, является ли это ошибкой сервера (5xx)
-                boolean isServerError = errorMsg.contains("502") || errorMsg.contains("503") ||
-                        errorMsg.contains("504") || errorMsg.contains("500");
-
-                // Проверяем, является ли это ошибкой авторизации (401, 403)
-                boolean isAuthError = errorMsg.contains("401") || errorMsg.contains("403");
-
-                if (isServerError) {
-                    // Для ошибок сервера делаем паузу и повторяем попытку
-                    log("Server error detected. Waiting 5 seconds before retry...");
-                    try {
-                        Thread.sleep(5000);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    }
-                    log("Retrying page " + currentPage);
-                    // Цикл продолжится с текущей страницы БЕЗ релогина
-
-                } else if (isAuthError) {
-                    // Для ошибок авторизации делаем релогин
-                    log("Auth error detected. Re-authenticating and continuing from page " + currentPage);
-                    try {
-                        currentToken = authenticateAndGetToken();
-                        log("Successfully re-authenticated. Continuing from page " + currentPage);
-                    } catch (Exception authException) {
-                        log("Re-authentication failed: " + authException.getMessage());
-                        throw new RuntimeException("Failed to re-authenticate: " + authException.getMessage(), authException);
-                    }
-
-                } else {
-                    // Для других ошибок пробуем релогин
-                    log("Unknown error. Re-authenticating and continuing from page " + currentPage);
-                    try {
-                        currentToken = authenticateAndGetToken();
-                        log("Successfully re-authenticated. Continuing from page " + currentPage);
-                    } catch (Exception authException) {
-                        log("Re-authentication failed: " + authException.getMessage());
-                        throw new RuntimeException("Failed to re-authenticate: " + authException.getMessage(), authException);
-                    }
-                }
-            }
+        } catch (Exception e) {
+            log("ERROR saving temp CSV: " + e.getMessage());
         }
     }
 
-    // Вспомогательный метод для обработки данных страницы
+    // -----------------------------
+    // DATA PROCESSING
+    // -----------------------------
     private void processPageData(JsonNode root, List<String> csvLines) {
         JsonNode items = root.path("_embedded").path("content");
 
@@ -419,8 +394,9 @@ public class Parser {
             csvLines.add(String.join("|", values));
         }
     }
-    // Helper methods
-
+    // -----------------------------
+    // HELPERS
+    // -----------------------------
     private String getOrEmpty(JsonNode node, String... path) {
         JsonNode current = node;
         for (String field : path) {
@@ -459,25 +435,17 @@ public class Parser {
     }
 
     // -----------------------------
-    // UTILITIES
+    // COOKIES
     // -----------------------------
-    private String readAndLogBody(ClientResponse resp) {
-        return resp.bodyToMono(String.class).block();
-    }
-
     private void extractCookies(ClientResponse resp) {
-        List<String> cookies = resp.headers().header(HttpHeaders.SET_COOKIE);
-        if (cookies == null) return;
-
-        for (String c : cookies) {
+        resp.headers().header(HttpHeaders.SET_COOKIE).forEach(c -> {
             if (c.contains("SESSION=") || c.contains("INGRESSCOOKIE=")) {
                 String clean = c.split(";", 2)[0];
                 if (!sessionCookie.contains(clean)) {
-                    if (sessionCookie.isEmpty()) sessionCookie = clean;
-                    else sessionCookie += "; " + clean;
+                    sessionCookie = sessionCookie.isEmpty() ? clean : sessionCookie + "; " + clean;
                 }
             }
-        }
+        });
     }
 
     private String extractCode(String loc) {
@@ -486,10 +454,35 @@ public class Parser {
         int amp = part.indexOf('&');
         return amp == -1 ? part : part.substring(0, amp);
     }
+    public void flushPartialCsv() {
+        try {
+            if (!exportRunning) {
+                System.out.println("No active export, nothing to flush.");
+                return;
+            }
 
-    private static String encode(String s) {
-        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+            List<String> snapshot;
+
+            synchronized (globalCsvLines) {
+                snapshot = new ArrayList<>(globalCsvLines);
+            }
+
+            if (snapshot.isEmpty()) {
+                System.out.println("No CSV data to flush.");
+                return;
+            }
+
+            Path path = Paths.get("export/shutdown_save.csv");
+            Files.createDirectories(path.getParent());
+            Files.write(path, snapshot, StandardCharsets.UTF_8);
+
+            System.out.println("✔ Shutdown autosave complete: " + path.toAbsolutePath());
+
+        } catch (Exception e) {
+            System.err.println("❌ Failed to flush CSV on shutdown: " + e.getMessage());
+        }
     }
+
 
     private static void log(String s) {
         System.out.println("[BERKUT] " + s);
